@@ -1,0 +1,31 @@
+[project]
+name = "leveldown-updater"
+version = "0.1.0"
+description = "Recoverable updates for packaged desktop applications"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "packaging>=26.0",
+    "portalocker[win32]>=4.4.0",
+    "psutil>=6.1.1",
+    "requests>=2.33.0",
+    "remotezip>=0.12.6",
+]
+
+[build-system]
+requires = ["setuptools>=82"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[dependency-groups]
+dev = ["ruff>=0.15.5"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "C", "B", "UP", "SIM", "TID"]
+ignore = ["E501", "C901", "SIM102"]
