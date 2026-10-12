@@ -13,9 +13,16 @@ from threading import Event
 from urllib.parse import quote
 
 from updater.directory import install_directory, recover_directory
+from updater.remote_zip import (
+    RangeInterrupted,
+    RangeUnavailable,
+    RemoteArchive,
+    manifest_files,
+)
 from updater.utils import (
     MAX_PACKAGE_BYTES,
     FileLease,
+    UpdateCancelled,
     UpdateError,
     check_cancelled,
     file_digest,
@@ -60,6 +67,7 @@ class GitHubUpdater:
         install_dir: Path,
         current_version: str,
         archive_prefix: str = "",
+        manifest_name: str | None = None,
     ):
         if re.fullmatch(r"[\w.-]+/[\w.-]+", repository) is None:
             raise UpdateError("Expected repository owner/name")
@@ -75,6 +83,9 @@ class GitHubUpdater:
         self.install_dir = Path(install_dir).resolve()
         self.current_version = current_version
         self.archive_prefix = archive_prefix
+        if manifest_name is not None and not relative_path(manifest_name):
+            raise UpdateError("Expected a relative manifest path")
+        self.manifest_name = manifest_name
 
     def _url(self, tag: str) -> str:
         return (
@@ -162,7 +173,13 @@ class GitHubUpdater:
         asset = asdict(release)
         del asset["notes"]
         identity = json.dumps(
-            [self.repository, self.asset_name, self.archive_prefix, asset],
+            [
+                self.repository,
+                self.asset_name,
+                self.archive_prefix,
+                self.manifest_name,
+                asset,
+            ],
             sort_keys=True,
         ).encode()
         return update_directory(self.install_dir) / (
@@ -192,6 +209,22 @@ class GitHubUpdater:
             for path in (archive, partial, work / "http.json", work / "package"):
                 if linked_path(path):
                     raise UpdateError("Download cache cannot contain links")
+            if self.manifest_name is not None and not archive.is_file():
+                try:
+                    self._partial_extract(work, release, cancelled, progress)
+                except RangeUnavailable:
+                    # Optional manifests and range support are not required for ordinary ZIPs.
+                    if (work / "ranges").exists():
+                        remove_directory(work / "ranges")
+                except (UpdateCancelled, RangeInterrupted):
+                    # Cancellation preserves already received range blocks and staged files.
+                    raise
+                except (ValueError, zipfile.BadZipFile):
+                    if (work / "ranges").exists():
+                        remove_directory(work / "ranges")
+                    raise
+                else:
+                    return PreparedUpdate(work, release.version)
             if not archive.is_file():
                 self._download(
                     release, partial, work / "http.json", progress, cancelled
@@ -204,6 +237,51 @@ class GitHubUpdater:
                     progress(release.size, release.size)
             self._extract(archive, work, release, cancelled)
             return PreparedUpdate(work, release.version)
+
+    def _manifest_files(self, source, release):
+        if self.manifest_name is None:
+            return None
+        name = self.archive_prefix + self.manifest_name
+        entries = source.infolist()
+        manifests = [item for item in entries if item.filename == name]
+        if not manifests:
+            return None
+        if (
+            len(manifests) != 1
+            or manifests[0].file_size > 4 * 1024**2
+            or manifests[0].flag_bits & 1
+            or stat.S_ISLNK(manifests[0].external_attr >> 16)
+        ):
+            raise UpdateError("Invalid or oversized update manifest")
+        content = source.read(manifests[0])
+        files = dict(
+            manifest_files(
+                json.loads(content),
+                release.version,
+                self.manifest_name,
+                self.install_dir,
+            )
+        )
+        files[self.manifest_name] = hashlib.sha256(content).hexdigest()
+        published = {
+            item.filename[len(self.archive_prefix) :]
+            for item in entries
+            if not item.is_dir()
+        }
+        if published != set(files):
+            raise UpdateError("ZIP files do not match the partial-update manifest")
+        return files
+
+    def _partial_extract(self, work, release, cancelled, progress):
+        assert self.manifest_name is not None
+        with RemoteArchive(release, work / "ranges", cancelled, progress) as remote:
+            with zipfile.ZipFile(remote) as source:
+                files = self._manifest_files(source, release)
+                if files is None:
+                    raise RangeUnavailable("ZIP does not contain the optional manifest")
+            self._extract(remote, work, release, cancelled, expected=files)
+            if progress is not None:
+                progress(remote.received, remote.received)
 
     def _verify_archive(self, archive: Path, release: GitHubRelease) -> None:
         if archive.stat().st_size != release.size or (
@@ -291,17 +369,19 @@ class GitHubUpdater:
             if offset != release.size:
                 raise UpdateError("Download interrupted before asset was complete")
 
-    def _extract(self, archive, work, release, cancelled):
+    def _extract(self, archive, work, release, cancelled, *, expected=None):
         package = work / "package"
         # Rebuild staging from the verified ZIP; a cancelled extraction never becomes installable.
         marker = work / "prepared.json"
         marker.unlink(missing_ok=True)
-        if package.exists():
+        if package.exists() and expected is None:
             remove_directory(package)
-        package.mkdir()
+        package.mkdir(exist_ok=True)
         files = {}
         try:
             with zipfile.ZipFile(archive) as source:
+                if expected is None:
+                    expected = self._manifest_files(source, release)
                 entries = source.infolist()
                 if (
                     len(entries) > 20000
@@ -337,16 +417,35 @@ class GitHubUpdater:
                     check_cancelled(cancelled)
                     target = target_path(package, name)
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    with source.open(item) as input_file, target.open("wb") as output:
-                        while chunk := input_file.read(65536):
-                            check_cancelled(cancelled)
-                            output.write(chunk)
+                    reused = False
+                    if expected is not None:
+                        assert name in expected
+                        if target.is_file() and file_digest(target) == expected[name]:
+                            reused = True
+                        else:
+                            local = target_path(self.install_dir, name)
+                            if local.is_file() and file_digest(local) == expected[name]:
+                                from updater.utils import _replace
+
+                                _replace(local, target, work / "reuse.tmp")
+                                reused = file_digest(target) == expected[name]
+                    if not reused:
+                        with (
+                            source.open(item) as input_file,
+                            target.open("wb") as output,
+                        ):
+                            while chunk := input_file.read(65536):
+                                check_cancelled(cancelled)
+                                output.write(chunk)
                     mode = stat.S_IMODE(item.external_attr >> 16) & 0o777
                     if mode:
                         target.chmod(mode)
                     files[name] = file_digest(target)
+                    if expected is not None and files[name] != expected[name]:
+                        raise UpdateError(f"Partial-update checksum mismatch: {name}")
         except zipfile.BadZipFile as exc:
-            archive.unlink(missing_ok=True)
+            if isinstance(archive, Path):
+                archive.unlink(missing_ok=True)
             raise UpdateError("Invalid ZIP asset; retry download") from exc
         write_json(
             marker,

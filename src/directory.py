@@ -93,7 +93,7 @@ def recover_directory(root: Path) -> bool:
         _cleanup_snapshot(work)
         return False
     originals = data["originals"]
-    if not isinstance(originals, dict) or not originals:
+    if not isinstance(originals, dict):
         raise UpdateError("Invalid transaction snapshot")
     if data["inventory"] is not None and not isinstance(data["inventory"], dict):
         raise UpdateError("Invalid previous inventory")
@@ -178,6 +178,21 @@ def install_directory(root, package, data, repository, asset_name, current_versi
             and file_digest(target) != old_files[name]
         ):
             raise UpdateError(f"Refusing to remove a locally modified file: {name}")
+    # Unchanged published files need neither replacement nor rollback snapshots.
+    names = {
+        name
+        for name in names
+        if (name not in files and target_path(root, name).exists())
+        or (
+            name in files
+            and (
+                not target_path(root, name).is_file()
+                or file_digest(target_path(root, name)) != files[name]
+                or stat.S_IMODE(target_path(root, name).stat().st_mode)
+                != stat.S_IMODE(target_path(package, name).stat().st_mode)
+            )
+        )
+    }
     work = directory / uuid.uuid4().hex
     work.mkdir()
     originals = {}
