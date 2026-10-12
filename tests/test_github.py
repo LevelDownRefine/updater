@@ -41,7 +41,7 @@ def archive(files):
 
 class TestGitHubUpdater(unittest.TestCase):
     def setUp(self):
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.client = GitHubUpdater(
             "example/application", "App.zip", self.root, "1.0.0", "App/"
         )
