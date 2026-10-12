@@ -18,16 +18,10 @@ from threading import Event
 import psutil
 
 from updater.package import (
-    MAX_PACKAGE_BYTES,
     VERSION_FILE,
-    UpdateCancelled,
-    UpdateError,
-    file_digest,
-    linked_path,
     load_manifest,
     manifest_frontend,
     unpack_package,
-    version_number,
 )
 from updater.policy import UpdatePolicy
 from updater.remote import (
@@ -36,11 +30,16 @@ from updater.remote import (
     UpdateInterrupted,
     open_archive,
 )
-from updater.runtime import (
+from updater.runtime import application_processes, child_environment
+from updater.utils import (
+    MAX_PACKAGE_BYTES,
     FileLease,
-    application_processes,
-    child_environment,
+    UpdateCancelled,
+    UpdateError,
+    file_digest,
+    linked_path,
     update_directory,
+    version_number,
 )
 
 logger = logging.getLogger(__name__)

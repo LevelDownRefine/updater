@@ -23,7 +23,7 @@ from updater import (
     UpdateError,
     directory,
 )
-from updater.package import file_digest
+from updater.utils import file_digest
 
 
 def archive(files):

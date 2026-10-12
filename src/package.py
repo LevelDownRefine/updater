@@ -8,42 +8,25 @@ import shutil
 import stat
 import zipfile
 from collections.abc import Callable
-from concurrent.futures import CancelledError
 from contextlib import nullcontext
 from pathlib import Path, PureWindowsPath
 from threading import Event
 
-from packaging.version import InvalidVersion, Version
-
 from updater.policy import UpdatePolicy
-from updater.storage import write_json
+from updater.utils import (
+    MAX_PACKAGE_BYTES,
+    UpdateError,
+    check_cancelled,
+    file_digest,
+    linked_path,
+    version_number,
+    write_json,
+)
 
 logger = logging.getLogger(__name__)
 
 MANIFEST = "update-manifest.json"
 VERSION_FILE = "version.json"
-MAX_PACKAGE_BYTES = 4 * 1024**3
-
-
-class UpdateError(ValueError):
-    """可恢复的更新输入或状态错误。"""
-
-
-class UpdateCancelled(UpdateError, CancelledError):
-    """用户中断下载；已下载的部分保留，供下次续传。"""
-
-
-def check_cancelled(cancelled: Event | None) -> None:
-    if cancelled is not None and cancelled.is_set():
-        raise UpdateCancelled("下载已取消")
-
-
-def version_number(value: str) -> Version:
-    """按版本语义比较，不按字符串比较。"""
-    try:
-        return Version(value)
-    except InvalidVersion as exc:
-        raise UpdateError(f"无法识别版本号: {value}") from exc
 
 
 def managed_path(name: str, *, policy: UpdatePolicy) -> bool:
@@ -66,13 +49,6 @@ def managed_path(name: str, *, policy: UpdatePolicy) -> bool:
     return policy.program_path(name)
 
 
-def linked_path(path: Path) -> bool:
-    """符号链接或 Windows junction；更新路径不允许落在链接后面。"""
-    return path.is_symlink() or bool(
-        path.exists() and getattr(path.lstat(), "st_file_attributes", 0) & 0x400
-    )
-
-
 def safe_target(root: Path, name: str, *, policy: UpdatePolicy) -> Path:
     """拒绝用户目录、符号链接和 Windows junction 造成的路径逃逸。
 
@@ -89,11 +65,6 @@ def safe_target(root: Path, name: str, *, policy: UpdatePolicy) -> Path:
     if not target.resolve().is_relative_to(root.resolve()):
         raise UpdateError(f"更新路径越界: {name}")
     return target
-
-
-def file_digest(path: Path) -> str:
-    with path.open("rb") as source:
-        return hashlib.file_digest(source, "sha256").hexdigest()
 
 
 def manifest_frontend(data: dict, *, policy: UpdatePolicy) -> str:

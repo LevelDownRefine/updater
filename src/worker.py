@@ -9,19 +9,10 @@ from pathlib import Path
 
 import psutil
 
-from updater.installer import (
-    install_package,
-    recover_installation,
-    write_json,
-)
+from updater.installer import install_package, recover_installation
 from updater.policy import UpdatePolicy
-from updater.runtime import (
-    FileLease,
-    UpdateBusyError,
-    application_processes,
-    child_environment,
-    update_directory,
-)
+from updater.runtime import application_processes, child_environment
+from updater.utils import FileLease, UpdateBusyError, update_directory, write_json
 
 logger = logging.getLogger(__name__)
 

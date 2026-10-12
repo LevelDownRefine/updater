@@ -6,15 +6,17 @@ on:
 jobs:
   source:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.13"
       - run: uv sync --locked
       - run: uv run python -m unittest discover -s tests -t .
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+      - run: uv build --wheel
+      - run: >-
+          uv run --isolated --no-project --python 3.13
+          --with ./dist/leveldown_updater-0.1.0-py3-none-any.whl
+          python -c "from updater import GitHubUpdater; from updater.utils import FileLease, write_json"

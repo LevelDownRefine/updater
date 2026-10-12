@@ -6,13 +6,8 @@ import zipfile
 from pathlib import Path
 
 from tests.support.policy import POLICY, REQUIRED_FILES, RUST_REQUIRED_FILES
-from updater.package import (
-    MANIFEST,
-    VERSION_FILE,
-    file_digest,
-    load_manifest,
-    write_manifest,
-)
+from updater.package import MANIFEST, VERSION_FILE, load_manifest, write_manifest
+from updater.utils import file_digest
 
 
 def make_package(root: Path, version="1.0.0", extra=None, *, frontend="qt"):

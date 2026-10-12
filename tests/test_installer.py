@@ -15,8 +15,9 @@ from tests.support.update_package import (
     stage_interrupted_install,
     stage_started_install,
 )
-from updater import installer
-from updater.package import MANIFEST, VERSION_FILE, UpdateError, load_manifest
+from updater import installer, utils
+from updater.package import MANIFEST, VERSION_FILE, load_manifest
+from updater.utils import UpdateError
 
 
 class InterruptedInstall(BaseException):
@@ -168,8 +169,8 @@ class TestUpdateInstaller(unittest.TestCase):
 
         with (
             patch.object(installer.os, "replace", side_effect=occupied),
-            patch.object(installer.time, "sleep") as sleep,
-            self.assertLogs(installer.__name__, level="WARNING"),
+            patch.object(utils.time, "sleep") as sleep,
+            self.assertLogs(utils.__name__, level="WARNING"),
         ):
             installer.install_package(self.root, self.new, policy=POLICY)
         self.assertEqual(len(attempts), 3)
@@ -191,7 +192,7 @@ class TestUpdateInstaller(unittest.TestCase):
 
         with (
             patch.object(installer.os, "replace", side_effect=missing),
-            patch.object(installer.time, "sleep") as sleep,
+            patch.object(utils.time, "sleep") as sleep,
             self.assertLogs(installer.__name__, level="ERROR"),
             self.assertRaises(FileNotFoundError),
         ):

@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from threading import Event
 
-from updater.package import MAX_PACKAGE_BYTES, UpdateError, check_cancelled
+from updater.utils import MAX_PACKAGE_BYTES, UpdateError, check_cancelled
 
 CHUNK = 65536
 

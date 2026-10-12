@@ -14,17 +14,19 @@ from threading import Event
 from urllib.parse import quote
 
 from updater.directory import install_directory, recover_directory
-from updater.package import (
+from updater.utils import (
     MAX_PACKAGE_BYTES,
+    FileLease,
     UpdateError,
     check_cancelled,
     file_digest,
     linked_path,
+    relative_path,
+    target_path,
+    update_directory,
     version_number,
+    write_json,
 )
-from updater.paths import relative_path, target_path
-from updater.runtime import FileLease, update_directory
-from updater.storage import write_json
 
 
 @dataclass(frozen=True)

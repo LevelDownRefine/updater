@@ -16,13 +16,9 @@ import portalocker
 from tests.support.policy import APP_EXE, CLI_EXE, POLICY, QT_CLI_EXE
 from tests.support.update_package import make_package, stage_interrupted_install
 from updater import worker as updater
-from updater.package import UpdateError, load_manifest
-from updater.runtime import (
-    FileLease,
-    UpdateBusyError,
-    application_lease,
-    application_processes,
-)
+from updater.package import load_manifest
+from updater.runtime import application_lease, application_processes
+from updater.utils import FileLease, UpdateBusyError, UpdateError
 
 
 class TestUpdateRuntime(unittest.TestCase):
@@ -64,7 +60,7 @@ class TestUpdateRuntime(unittest.TestCase):
     def test_backend_failure_is_reported_as_update_error(self):
         with (
             patch(
-                "updater.runtime.portalocker.Lock.acquire",
+                "updater.utils.portalocker.Lock.acquire",
                 side_effect=portalocker.LockException("unsupported filesystem"),
             ),
             self.assertRaisesRegex(UpdateError, "unsupported filesystem") as raised,
@@ -75,7 +71,7 @@ class TestUpdateRuntime(unittest.TestCase):
 
     def test_process_exit_releases_update_intent(self):
         code = (
-            "from pathlib import Path; from updater.runtime import FileLease; "
+            "from pathlib import Path; from updater.utils import FileLease; "
             "import os,sys; lock=FileLease(Path(sys.argv[1])); lock.__enter__(); os._exit(0)"
         )
         path = self.root / ".update/intent.lock"

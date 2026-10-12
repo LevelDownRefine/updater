@@ -6,11 +6,16 @@ import shutil
 import uuid
 from pathlib import Path
 
-from updater.installer import _replace
-from updater.package import UpdateError, file_digest, linked_path, version_number
-from updater.paths import target_path
-from updater.runtime import update_directory
-from updater.storage import write_json
+from updater.utils import (
+    UpdateError,
+    _replace,
+    file_digest,
+    linked_path,
+    target_path,
+    update_directory,
+    version_number,
+    write_json,
+)
 
 logger = logging.getLogger(__name__)
 

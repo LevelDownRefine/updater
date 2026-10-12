@@ -1,44 +1,30 @@
 """可恢复的程序文件替换；只操作新旧清单拥有的路径。"""
 
-import contextlib
-import errno
 import json
 import logging
 import os
 import shutil
-import time
 import uuid
 from pathlib import Path
 
 from updater.package import (
     MANIFEST,
     VERSION_FILE,
-    UpdateError,
-    file_digest,
     load_manifest,
     manifest_frontend,
     safe_target,
-    version_number,
 )
 from updater.policy import UpdatePolicy
-from updater.runtime import update_directory
-from updater.storage import write_json
+from updater.utils import (
+    UpdateError,
+    _replace,
+    file_digest,
+    update_directory,
+    version_number,
+    write_json,
+)
 
 logger = logging.getLogger(__name__)
-
-REPLACE_ATTEMPTS = 5
-REPLACE_BACKOFF_SECONDS = 0.2
-# 文件被其他进程短暂持有：Windows 的拒绝访问与共享冲突，POSIX 的权限与占用。
-TRANSIENT_WINERRORS = frozenset({5, 32, 33})
-TRANSIENT_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EBUSY, errno.ETXTBSY})
-
-
-def _transient_occupation(exc: OSError) -> bool:
-    """瞬时占用可退避重试；其余失败立即上抛，不掩盖确定性错误。"""
-    winerror = getattr(exc, "winerror", None)
-    if winerror is not None:
-        return winerror in TRANSIENT_WINERRORS
-    return exc.errno in TRANSIENT_ERRNOS
 
 
 def _transaction_identity(data: dict) -> str | None:
@@ -56,33 +42,6 @@ def _transaction_identity(data: dict) -> str | None:
 def _swap(directory: Path) -> Path:
     """替换用的临时文件：名字带进程号，共享锁下并发启动不会互相踩。"""
     return directory / f"swap.{os.getpid()}.tmp"
-
-
-def _replace(source: Path, target: Path, temporary: Path) -> None:
-    """copy/fsync/原子替换；占用退避重试，不让偶发失败中断整次安装或回滚。"""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    for attempt in range(REPLACE_ATTEMPTS):
-        try:
-            shutil.copy2(source, temporary)
-            with temporary.open("r+b") as stream:
-                os.fsync(stream.fileno())
-            os.replace(temporary, target)
-            return
-        except OSError as exc:
-            if attempt + 1 == REPLACE_ATTEMPTS or not _transient_occupation(exc):
-                # 清掉半成品；清理本身失败不能盖住真正的异常。
-                with contextlib.suppress(OSError):
-                    temporary.unlink(missing_ok=True)
-                raise
-            delay = REPLACE_BACKOFF_SECONDS * 2**attempt
-            logger.warning(
-                "文件被占用，%.1f 秒后重试: %s (%s: %s)",
-                delay,
-                target.name,
-                type(exc).__name__,
-                exc,
-            )
-            time.sleep(delay)
 
 
 def recover_installation(root: Path, *, policy: UpdatePolicy) -> bool:

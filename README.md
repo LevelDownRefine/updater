@@ -80,4 +80,8 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
+源码直接位于 `src/`；通用路径、校验、锁和文件操作集中于 `src/utils.py`。
+打包配置将 `src/` 映射为安装后的 `updater` 包，避免与调用方自身的 `src` 包冲突。
+CI 只测试 Python 3.13；最低支持版本仍为 Python 3.11。
+
 测试使用临时目录、合成应用和本地 HTTP 服务，不访问真实安装或用户配置。

@@ -5,53 +5,12 @@ import logging
 import os
 from pathlib import Path
 
-import portalocker
 import psutil
 
-from updater.package import UpdateError, linked_path
 from updater.policy import UpdatePolicy
+from updater.utils import FileLease, UpdateError, update_directory
 
 logger = logging.getLogger(__name__)
-
-
-class UpdateBusyError(UpdateError):
-    """更新或脚本运行尚未结束。"""
-
-
-class FileLease:
-    """共享运行锁和独占更新锁，由 portalocker 管理跨平台加锁与释放。"""
-
-    def __init__(self, path: Path, *, shared: bool = False, timeout: float = 0):
-        self.path = path
-        self.lock = portalocker.Lock(
-            path,
-            mode="a+b",
-            timeout=timeout,
-            check_interval=0.1,
-            flags=(portalocker.LOCK_SH if shared else portalocker.LOCK_EX)
-            | portalocker.LOCK_NB,
-        )
-
-    def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self.lock.acquire()
-        except portalocker.AlreadyLocked as exc:
-            raise UpdateBusyError("应用正在运行任务或更新，请稍后重试") from exc
-        except portalocker.LockException as exc:
-            raise UpdateError(f"无法锁定安装目录: {exc}") from exc
-        return self
-
-    def __exit__(self, *args):
-        self.lock.__exit__(*args)
-
-
-def update_directory(root: Path) -> Path:
-    directory = root / ".update"
-    if linked_path(directory):
-        raise UpdateError("更新工作目录不能是链接")
-    directory.mkdir(exist_ok=True)
-    return directory
 
 
 @contextlib.contextmanager
@@ -61,7 +20,7 @@ def application_lease(root: Path, *, policy: UpdatePolicy):
     with contextlib.ExitStack() as stack:
         with FileLease(directory / "intent.lock", shared=True):
             stack.enter_context(FileLease(directory / "runtime.lock", shared=True))
-            # installer 依赖本模块的 update_directory，只能在调用点导入。
+            # 安装状态检查按需加载，避免循环依赖。
             from updater.installer import settle_transaction
 
             if not settle_transaction(root, policy=policy):

@@ -14,7 +14,8 @@ import requests
 from tests.support.policy import POLICY, UPDATER_EXE
 from tests.support.update_package import archive_package, make_package, program_snapshot
 from updater import service
-from updater.package import UpdateError, load_manifest
+from updater.package import load_manifest
+from updater.utils import UpdateError
 
 
 class Response:

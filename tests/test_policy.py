@@ -9,8 +9,9 @@ from pathlib import Path
 
 from tests.support.policy import POLICY
 from tests.support.update_package import archive_package, make_package
-from updater.package import UpdateError, load_manifest, managed_path, unpack_package
+from updater.package import load_manifest, managed_path, unpack_package
 from updater.service import UpdateService
+from updater.utils import UpdateError
 
 
 class PolicyTests(unittest.TestCase):

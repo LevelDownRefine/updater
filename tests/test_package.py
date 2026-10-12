@@ -10,14 +10,9 @@ from unittest.mock import Mock, patch
 from tests.support.policy import POLICY
 from tests.support.update_package import archive_package, make_package
 from updater import package
-from updater.package import (
-    UpdateError,
-    load_manifest,
-    parse_manifest,
-    safe_target,
-    unpack_package,
-)
-from updater.storage import write_json as save_data
+from updater.package import load_manifest, parse_manifest, safe_target, unpack_package
+from updater.utils import UpdateError
+from updater.utils import write_json as save_data
 
 
 class TestUpdatePackage(unittest.TestCase):
