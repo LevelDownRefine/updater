@@ -5,9 +5,12 @@ import errno
 import hashlib
 import json
 import logging
+import ntpath
 import os
 import re
 import shutil
+import stat
+import sys
 import time
 from concurrent.futures import CancelledError
 from pathlib import Path, PureWindowsPath
@@ -67,7 +70,7 @@ def relative_path(name: str) -> bool:
             part
             and part not in {".", ".."}
             and not part.endswith((".", " "))
-            and not PureWindowsPath(part).is_reserved()
+            and not _reserved(part)
             and not any(char in part for char in '\\:*?"<>|')
             and not any(ord(char) < 32 for char in part)
             and re.search(r"\.bak\d*$", part, re.IGNORECASE) is None
@@ -75,6 +78,12 @@ def relative_path(name: str) -> bool:
             for part in name.split("/")
         )
     )
+
+
+def _reserved(name: str) -> bool:
+    if hasattr(ntpath, "isreserved"):
+        return ntpath.isreserved(name)
+    return PureWindowsPath(name).is_reserved()
 
 
 def target_path(root: Path, name: str) -> Path:
@@ -151,21 +160,86 @@ def _transient_occupation(exc: OSError) -> bool:
     return exc.errno in TRANSIENT_ERRNOS
 
 
+@contextlib.contextmanager
+def _writable(path: Path):
+    """Temporarily clear Windows read-only attributes; restore them on failure."""
+    mode = None
+    if os.name == "nt" and path.exists():
+        original = stat.S_IMODE(path.stat().st_mode)
+        if not original & stat.S_IWRITE:
+            path.chmod(original | stat.S_IWRITE)
+            mode = original
+    try:
+        yield
+    except OSError:
+        if mode is not None and path.exists():
+            try:
+                path.chmod(mode)
+            except OSError:
+                logger.warning(
+                    "Cannot restore read-only attributes: %s", path, exc_info=True
+                )
+        raise
+
+
+def unlink_file(path: Path) -> None:
+    """Remove an owned file, including Windows read-only files."""
+    with _writable(path):
+        path.unlink(missing_ok=True)
+
+
+def remove_directory(path: Path) -> None:
+    """Delete an owned workspace, handling Windows read-only cached files."""
+    if linked_path(path):
+        raise UpdateError("Workspace cannot be a link")
+
+    def readonly(function, name, error):
+        target = Path(name)
+        if (
+            os.name != "nt"
+            or not isinstance(error, PermissionError)
+            or function not in (os.unlink, os.rmdir)
+            or linked_path(target)
+            or not target.exists()
+            or stat.S_IMODE(target.stat().st_mode) & stat.S_IWRITE
+        ):
+            raise error
+        with _writable(target):
+            function(name)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=readonly)
+    else:
+        shutil.rmtree(
+            path, onerror=lambda function, name, info: readonly(function, name, info[1])
+        )
+
+
 def _replace(source: Path, target: Path, temporary: Path) -> None:
     """copy/fsync/原子替换；占用退避重试，不让偶发失败中断整次安装或回滚。"""
     target.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(REPLACE_ATTEMPTS):
         try:
-            shutil.copy2(source, temporary)
-            with temporary.open("r+b") as stream:
-                os.fsync(stream.fileno())
-            os.replace(temporary, target)
+            if linked_path(temporary):
+                raise UpdateError("Temporary replacement file cannot be a link")
+            unlink_file(temporary)
+            with source.open("rb") as input_file, temporary.open("wb") as output:
+                shutil.copyfileobj(input_file, output)
+                output.flush()
+                os.fsync(output.fileno())
+            shutil.copystat(source, temporary)
+            with _writable(target):
+                os.replace(temporary, target)
             return
         except OSError as exc:
             if attempt + 1 == REPLACE_ATTEMPTS or not _transient_occupation(exc):
                 # 清掉半成品；清理本身失败不能盖住真正的异常。
-                with contextlib.suppress(OSError):
-                    temporary.unlink(missing_ok=True)
+                try:
+                    unlink_file(temporary)
+                except OSError:
+                    logger.warning(
+                        "Cannot remove failed replacement: %s", temporary, exc_info=True
+                    )
                 raise
             delay = REPLACE_BACKOFF_SECONDS * 2**attempt
             logger.warning(

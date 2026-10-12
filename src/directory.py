@@ -2,7 +2,7 @@
 
 import json
 import logging
-import shutil
+import stat
 import uuid
 from pathlib import Path
 
@@ -11,13 +11,27 @@ from updater.utils import (
     _replace,
     file_digest,
     linked_path,
+    remove_directory,
     target_path,
+    unlink_file,
     update_directory,
     version_number,
     write_json,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _cleanup_snapshot(work: Path) -> None:
+    if work.exists():
+        try:
+            remove_directory(work)
+        except OSError:
+            logger.warning(
+                "Transaction finished; unable to remove snapshots: %s",
+                work,
+                exc_info=True,
+            )
 
 
 def _record(path: Path) -> dict:
@@ -65,8 +79,6 @@ def recover_directory(root: Path) -> bool:
         "rolled_back",
     }:
         raise UpdateError("Invalid installation journal")
-    if data["phase"] != "installing":
-        return False
     identity = data["transaction"]
     if (
         not isinstance(identity, str)
@@ -77,6 +89,9 @@ def recover_directory(root: Path) -> bool:
     work = directory / identity
     if linked_path(work) or linked_path(work / "previous"):
         raise UpdateError("Snapshot directory cannot be a link")
+    if data["phase"] != "installing":
+        _cleanup_snapshot(work)
+        return False
     originals = data["originals"]
     if not isinstance(originals, dict) or not originals:
         raise UpdateError("Invalid transaction snapshot")
@@ -95,9 +110,12 @@ def recover_directory(root: Path) -> bool:
     for name, digest in originals.items():
         target = target_path(root, name)
         if digest is None:
-            target.unlink(missing_ok=True)
+            unlink_file(target)
         elif target.is_file() and file_digest(target) == digest:
-            continue
+            source = target_path(work / "previous", name)
+            mode = stat.S_IMODE(source.stat().st_mode)
+            if stat.S_IMODE(target.stat().st_mode) != mode:
+                target.chmod(mode)
         else:
             _replace(target_path(work / "previous", name), target, work / "swap.tmp")
     if data["inventory"] is None:
@@ -107,6 +125,7 @@ def recover_directory(root: Path) -> bool:
     data["phase"] = "rolled_back"
     write_json(journal, data)
     logger.info("Restored interrupted installation")
+    _cleanup_snapshot(work)
     return True
 
 
@@ -184,7 +203,7 @@ def install_directory(root, package, data, repository, asset_name, current_versi
             if name in files:
                 _replace(target_path(package, name), target, work / "swap.tmp")
             else:
-                target.unlink(missing_ok=True)
+                unlink_file(target)
         write_json(
             inventory,
             {
@@ -200,11 +219,4 @@ def install_directory(root, package, data, repository, asset_name, current_versi
         logger.exception("Installation failed; restoring previous files")
         recover_directory(root)
         raise
-    try:
-        shutil.rmtree(work)
-    except OSError:
-        logger.warning(
-            "Installed successfully; unable to remove snapshots: %s",
-            work,
-            exc_info=True,
-        )
+    _cleanup_snapshot(work)

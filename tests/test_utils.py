@@ -1,5 +1,6 @@
 """Shared filesystem helpers operate without a release policy or installer."""
 
+import stat
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,38 @@ from updater import utils
 
 
 class TestFilesystemUtils(unittest.TestCase):
+    def test_readonly_replacement_is_flushed_before_permissions_are_applied(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, target, temporary = root / "new", root / "old", root / "swap"
+            source.write_bytes(b"new program")
+            target.write_bytes(b"old program")
+            source.chmod(0o444)
+            target.chmod(0o444)
+            real_fsync = utils.os.fsync
+
+            def writable_flush(fd):
+                self.assertTrue(
+                    stat.S_IMODE(utils.os.fstat(fd).st_mode) & stat.S_IWRITE
+                )
+                real_fsync(fd)
+
+            with patch.object(utils.os, "fsync", side_effect=writable_flush):
+                utils._replace(source, target, temporary)
+            self.assertEqual(target.read_bytes(), b"new program")
+            self.assertFalse(stat.S_IMODE(target.stat().st_mode) & stat.S_IWRITE)
+            utils.unlink_file(target)
+            self.assertFalse(target.exists())
+
+    def test_remove_workspace_with_readonly_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            work = Path(folder) / "work"
+            work.mkdir()
+            (work / "readonly").write_bytes(b"cached resource")
+            (work / "readonly").chmod(0o444)
+            utils.remove_directory(work)
+            self.assertFalse(work.exists())
+
     def test_shared_leases_prevent_exclusive_installation(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "update.lock"

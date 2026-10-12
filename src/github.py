@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import zipfile
 from collections.abc import Callable
@@ -22,6 +21,7 @@ from updater.utils import (
     file_digest,
     linked_path,
     relative_path,
+    remove_directory,
     target_path,
     update_directory,
     version_number,
@@ -297,7 +297,7 @@ class GitHubUpdater:
         marker = work / "prepared.json"
         marker.unlink(missing_ok=True)
         if package.exists():
-            shutil.rmtree(package)
+            remove_directory(package)
         package.mkdir()
         files = {}
         try:
@@ -311,7 +311,7 @@ class GitHubUpdater:
                 names = set()
                 members = []
                 for item in entries:
-                    name = item.filename
+                    name = item.orig_filename
                     if (
                         not name.startswith(self.archive_prefix)
                         or item.flag_bits & 1
@@ -415,4 +415,4 @@ class GitHubUpdater:
             if linked_path(work):
                 raise UpdateError("Download workspace cannot be a link")
             if work.exists():
-                shutil.rmtree(work)
+                remove_directory(work)

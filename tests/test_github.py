@@ -5,6 +5,7 @@ import http.server
 import io
 import json
 import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -31,7 +32,10 @@ def archive(files):
     with zipfile.ZipFile(output, "w") as bundle:
         bundle.writestr("App/", b"")
         for name, content in files.items():
-            bundle.writestr("App/" + name, content)
+            entry = zipfile.ZipInfo("placeholder")
+            entry.filename = "App/" + name
+            entry.orig_filename = entry.filename
+            bundle.writestr(entry, content)
     return output.getvalue()
 
 
@@ -339,6 +343,10 @@ class TestGitHubUpdater(unittest.TestCase):
         self.assertFalse((self.root / "config/app.example.yml").exists())
         self.assertFalse((self.root / ".update/github-installed.json").exists())
         self.assertFalse(self.client.recover())
+        journal = json.loads(
+            (self.root / ".update/github-transaction.json").read_text()
+        )
+        self.assertFalse((self.root / ".update" / journal["transaction"]).exists())
 
     def test_rollback_skips_unchanged_locked_original(self):
         self.content = archive({"a.exe": b"new a", "b.dll": b"old b"})
@@ -370,6 +378,34 @@ class TestGitHubUpdater(unittest.TestCase):
         )
         self.assertEqual(journal["phase"], "rolled_back")
         self.assertFalse((self.root / ".update/github-installed.json").exists())
+
+    def test_rollback_restores_permissions_when_content_is_unchanged(self):
+        (self.root / "a.sh").write_bytes(b"same content")
+        (self.root / "a.sh").chmod(0o755)
+        (self.root / "b.txt").write_bytes(b"old b")
+        original_mode = stat.S_IMODE((self.root / "a.sh").stat().st_mode)
+        self.content = archive({"a.sh": b"same content", "b.txt": b"new b"})
+        self.release = self.make_release()
+        prepared = self.client.download(self.release)
+        (prepared.directory / "package/a.sh").chmod(0o444)
+        real_replace = directory._replace
+
+        def failure(source, target, temporary):
+            if source == prepared.directory / "package/b.txt":
+                raise PermissionError("second file is locked")
+            return real_replace(source, target, temporary)
+
+        with (
+            patch.object(directory, "_replace", side_effect=failure),
+            self.assertLogs(directory.__name__, level="ERROR"),
+            self.assertRaises(PermissionError),
+        ):
+            self.client.install(prepared)
+        self.assertEqual((self.root / "a.sh").read_bytes(), b"same content")
+        self.assertEqual(
+            stat.S_IMODE((self.root / "a.sh").stat().st_mode), original_mode
+        )
+        self.assertFalse(self.client.recover())
 
     def test_prepared_tampering_is_rejected_before_writes(self):
         prepared = self.client.download(self.release)
