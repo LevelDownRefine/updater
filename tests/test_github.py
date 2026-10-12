@@ -4,6 +4,7 @@ import hashlib
 import http.server
 import io
 import json
+import logging
 import os
 import stat
 import tempfile
@@ -24,10 +25,11 @@ from updater import (
     UpdateError,
     directory,
 )
+from updater.remote_zip import RangeInterrupted
 from updater.utils import file_digest
 
 
-def archive(files):
+def archive(files, compression=zipfile.ZIP_STORED):
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w") as bundle:
         bundle.writestr("App/", b"")
@@ -35,6 +37,7 @@ def archive(files):
             entry = zipfile.ZipInfo("placeholder")
             entry.filename = "App/" + name
             entry.orig_filename = entry.filename
+            entry.compress_type = compression
             bundle.writestr(entry, content)
     return output.getvalue()
 
@@ -53,15 +56,28 @@ class TestGitHubUpdater(unittest.TestCase):
         self.ignore_if_range = False
         self.disconnect_once = False
         self.send_validator = True
+        self.partial_head = False
+        self.sent = 0
         self.requests = []
         fixture = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                if not fixture.partial_head:
+                    self.send_error(501)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(fixture.content)))
+                if fixture.send_validator:
+                    self.send_header("ETag", fixture.etag)
+                self.end_headers()
+
             def do_GET(self):
                 # Range is optional on the initial request.
                 requested = self.headers.get("Range", None)
                 fixture.requests.append(requested)
                 start = 0
+                end = len(fixture.content) - 1
                 if (
                     requested
                     and fixture.supports_range
@@ -70,24 +86,38 @@ class TestGitHubUpdater(unittest.TestCase):
                         or self.headers["If-Range"] == fixture.etag
                     )
                 ):
-                    start = int(requested.removeprefix("bytes=").removesuffix("-"))
+                    first, last = requested.removeprefix("bytes=").split("-", 1)
+                    start = int(first)
+                    if last:
+                        end = int(last)
                     self.send_response(206)
                     self.send_header(
                         "Content-Range",
-                        f"bytes {start}-{len(fixture.content) - 1}/{len(fixture.content)}",
+                        f"bytes {start}-{end}/{len(fixture.content)}",
                     )
                 else:
                     self.send_response(200)
                 if fixture.send_validator:
                     self.send_header("ETag", fixture.etag)
-                self.send_header("Content-Length", str(len(fixture.content) - start))
+                self.send_header("Content-Length", str(end - start + 1))
                 self.end_headers()
                 if fixture.disconnect_once:
                     fixture.disconnect_once = False
-                    self.wfile.write(fixture.content[start : start + 100000])
+                    count = min(100000, end - start + 1)
+                    if requested and requested.split("-", 1)[1]:
+                        count = max(1, count // 2)
+                    self.wfile.write(fixture.content[start : start + count])
+                    fixture.sent += count
                     self.close_connection = True
                     return
-                self.wfile.write(fixture.content[start:])
+                try:
+                    self.wfile.write(fixture.content[start : end + 1])
+                except (BrokenPipeError, ConnectionResetError) as exc:
+                    logging.getLogger(__name__).debug(
+                        "Client rejected range response: %s", exc
+                    )
+                else:
+                    fixture.sent += end - start + 1
 
             def log_message(self, format, *args):
                 # HTTP requests are recorded above for assertions.
@@ -112,6 +142,155 @@ class TestGitHubUpdater(unittest.TestCase):
             len(self.content),
             hashlib.sha256(self.content).hexdigest(),
         )
+
+    def partial_fixture(self):
+        self.partial_head = True
+        self.client.manifest_name = "update-manifest.json"
+        files = {
+            "unchanged.bin": os.urandom(1024 * 1024),
+            "changed.bin": os.urandom(300000),
+        }
+        (self.root / "unchanged.bin").write_bytes(files["unchanged.bin"])
+        (self.root / "unchanged.bin").chmod(0o600)
+        manifest = {
+            "schema": 1,
+            "version": "1.1.0",
+            "files": {
+                name: hashlib.sha256(body).hexdigest() for name, body in files.items()
+            },
+        }
+        self.content = archive(
+            {**files, "update-manifest.json": json.dumps(manifest).encode()}
+        )
+        self.release = self.make_release()
+        return files
+
+    def test_partial_download_reuses_local_bytes_and_installs_without_replacing_them(
+        self,
+    ):
+        files = self.partial_fixture()
+        inode = (self.root / "unchanged.bin").stat().st_ino
+        prepared = self.client.download(self.release)
+        self.assertLess(self.sent, len(self.content) // 2)
+        self.assertTrue(all(request is not None for request in self.requests))
+        self.client.install(prepared)
+        self.assertEqual((self.root / "changed.bin").read_bytes(), files["changed.bin"])
+        self.assertEqual((self.root / "unchanged.bin").stat().st_ino, inode)
+
+    def test_partial_cancel_resumes_cached_blocks_and_staging(self):
+        self.partial_fixture()
+        cancelled = Event()
+
+        def progress(received, total):
+            if received >= 100000:
+                cancelled.set()
+
+        with self.assertRaises(UpdateCancelled):
+            self.client.download(self.release, progress=progress, cancelled=cancelled)
+        before = self.sent
+        requested_before = list(self.requests)
+        self.client.download(self.release)
+        self.assertLess(self.sent, len(self.content) // 2)
+        self.assertGreater(self.sent, before)
+        self.assertTrue(
+            set(requested_before).isdisjoint(self.requests[len(requested_before) :])
+        )
+
+    def test_partial_falls_back_when_manifest_or_range_support_is_missing(self):
+        self.partial_head = True
+        self.client.manifest_name = "update-manifest.json"
+        prepared = self.client.download(self.release)
+        self.assertTrue((prepared.directory / "archive.zip").is_file())
+        self.client.discard(self.release)
+        self.partial_fixture()
+        self.supports_range = False
+        prepared = self.client.download(self.release)
+        self.assertTrue((prepared.directory / "archive.zip").is_file())
+
+    def test_partial_rejects_false_file_hash_without_installing(self):
+        files = self.partial_fixture()
+        files["changed.bin"] = b"wrong"
+        self.content = archive(
+            {
+                **files,
+                "update-manifest.json": json.dumps(
+                    {
+                        "schema": 1,
+                        "version": "1.1.0",
+                        "files": {
+                            name: hashlib.sha256(body).hexdigest()
+                            if name != "changed.bin"
+                            else "0" * 64
+                            for name, body in files.items()
+                        },
+                    }
+                ).encode(),
+            }
+        )
+        self.release = self.make_release()
+        with self.assertRaisesRegex(UpdateError, "checksum mismatch"):
+            self.client.download(self.release)
+        self.assertFalse((self.client._work(self.release) / "prepared.json").exists())
+        self.assertFalse((self.root / "changed.bin").exists())
+
+    def test_partial_network_disconnect_keeps_ranges_for_retry(self):
+        self.partial_fixture()
+        self.disconnect_once = True
+        with self.assertRaises(RangeInterrupted):
+            self.client.download(self.release)
+        self.assertTrue((self.client._work(self.release) / "ranges").is_dir())
+        prepared = self.client.download(self.release)
+        self.assertTrue((prepared.directory / "prepared.json").is_file())
+        self.assertLess(self.sent, len(self.content) // 2)
+
+    def test_partial_reloads_corrupt_cached_range(self):
+        self.partial_fixture()
+        prepared = self.client.download(self.release)
+        cached = list((prepared.directory / "ranges").glob("*.bin"))
+        for path in cached:
+            path.write_bytes(b"x" * path.stat().st_size)
+        with self.assertRaises((UpdateError, zipfile.BadZipFile)):
+            self.client.download(self.release)
+        self.assertFalse((prepared.directory / "ranges").exists())
+        self.client.download(self.release)
+
+    def test_partial_reloads_corrupt_deflate_block(self):
+        self.partial_fixture()
+        with zipfile.ZipFile(io.BytesIO(self.content)) as source:
+            files = {
+                item.filename.removeprefix("App/"): source.read(item)
+                for item in source.infolist()
+                if not item.is_dir()
+            }
+        self.content = archive(files, compression=zipfile.ZIP_DEFLATED)
+        self.release = self.make_release()
+        prepared = self.client.download(self.release)
+        with zipfile.ZipFile(io.BytesIO(self.content)) as source:
+            item = source.getinfo("App/changed.bin")
+        offset = item.header_offset + 30 + len(item.filename.encode()) + len(item.extra)
+        block_start = offset // 65536 * 65536
+        block = prepared.directory / "ranges" / f"{block_start}.bin"
+        data = bytearray(block.read_bytes())
+        data[offset - block_start] = 7  # Invalid DEFLATE block type.
+        block.write_bytes(data)
+        (prepared.directory / "package/changed.bin").unlink()
+        with self.assertRaises(UpdateError):
+            self.client.download(self.release)
+        self.assertFalse((prepared.directory / "ranges").exists())
+        self.client.download(self.release)
+
+    def test_full_fallback_still_rejects_bad_manifest_hash(self):
+        self.partial_fixture()
+        self.supports_range = False
+        files = {"changed.bin": b"wrong"}
+        manifest = {"schema": 1, "version": "1.1.0", "files": {"changed.bin": "0" * 64}}
+        self.content = archive(
+            {**files, "update-manifest.json": json.dumps(manifest).encode()}
+        )
+        self.release = self.make_release()
+        with self.assertRaisesRegex(UpdateError, "checksum mismatch"):
+            self.client.download(self.release)
+        self.assertFalse((self.client._work(self.release) / "prepared.json").exists())
 
     def pause(self):
         cancelled = Event()
@@ -349,11 +528,17 @@ class TestGitHubUpdater(unittest.TestCase):
         self.assertFalse((self.root / ".update" / journal["transaction"]).exists())
 
     def test_rollback_skips_unchanged_locked_original(self):
-        self.content = archive({"a.exe": b"new a", "b.dll": b"old b"})
+        self.content = archive(
+            {"a.exe": b"new a", "b.dll": b"old b", "c.exe": b"new c"}
+        )
         self.release = self.make_release()
         (self.root / "a.exe").write_bytes(b"old a")
         (self.root / "b.dll").write_bytes(b"old b")
+        (self.root / "c.exe").write_bytes(b"old c")
         prepared = self.client.download(self.release)
+        (prepared.directory / "package/b.dll").chmod(
+            (self.root / "b.dll").stat().st_mode
+        )
         real_replace = directory._replace
         locked_attempts = []
 
@@ -361,6 +546,8 @@ class TestGitHubUpdater(unittest.TestCase):
             if target == self.root / "b.dll":
                 locked_attempts.append(source)
                 raise PermissionError("DLL locked")
+            if source == prepared.directory / "package/c.exe":
+                raise PermissionError("changed executable locked")
             return real_replace(source, target, temporary)
 
         with patch.object(directory, "_replace", side_effect=occupied):
@@ -370,9 +557,10 @@ class TestGitHubUpdater(unittest.TestCase):
             ):
                 self.client.install(prepared)
             self.assertFalse(self.client.recover())
-        self.assertEqual(len(locked_attempts), 1)
+        self.assertEqual(len(locked_attempts), 0)
         self.assertEqual((self.root / "a.exe").read_bytes(), b"old a")
         self.assertEqual((self.root / "b.dll").read_bytes(), b"old b")
+        self.assertEqual((self.root / "c.exe").read_bytes(), b"old c")
         journal = json.loads(
             (self.root / ".update/github-transaction.json").read_text()
         )
