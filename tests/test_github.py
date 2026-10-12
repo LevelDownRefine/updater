@@ -198,6 +198,36 @@ class TestGitHubUpdater(unittest.TestCase):
         self.client.download(self.release)
         self.assertEqual(self.requests, [None, None])
 
+    def test_discard_can_clean_installed_and_older_releases(self):
+        prepared = self.client.download(self.release)
+        self.client.install(prepared)
+        for current_version in ("1.1.0", "1.2.0"):
+            with self.subTest(current_version=current_version):
+                prepared.directory.mkdir(exist_ok=True)
+                (prepared.directory / "archive.partial").write_bytes(b"saved bytes")
+                self.client.current_version = current_version
+                self.client.discard(self.release)
+                self.assertFalse(prepared.directory.exists())
+        self.assertTrue((self.root / "app.exe").is_file())
+        self.assertTrue((self.root / ".update/github-installed.json").is_file())
+
+    def test_discard_still_rejects_foreign_assets(self):
+        work = self.pause()
+        foreign = replace(
+            self.release, archive_url="https://github.com/other/repo/App.zip"
+        )
+        with self.assertRaisesRegex(UpdateError, "Invalid release asset"):
+            self.client.discard(foreign)
+        self.assertTrue(work.is_dir())
+
+    def test_download_still_rejects_installed_and_older_releases(self):
+        for current_version in ("1.1.0", "1.2.0"):
+            with self.subTest(current_version=current_version):
+                self.client.current_version = current_version
+                with self.assertRaisesRegex(UpdateError, "newer"):
+                    self.client.download(self.release)
+        self.assertEqual(self.requests, [])
+
     def test_full_response_restarts_partial_download(self):
         self.pause()
         self.supports_range = False
@@ -262,6 +292,25 @@ class TestGitHubUpdater(unittest.TestCase):
         self.assertFalse((self.root / "app.exe").exists())
         self.assertEqual((self.root / "unrelated.txt").read_bytes(), b"keep")
 
+    def test_new_published_path_cannot_overwrite_unowned_user_file(self):
+        self.client.install(self.client.download(self.release))
+        old_program = (self.root / "app.exe").read_bytes()
+        old_inventory = (self.root / ".update/github-installed.json").read_bytes()
+        (self.root / "notes.txt").write_bytes(b"USER NOTES")
+        self.content = archive(
+            {"app.exe": b"new program", "notes.txt": b"RELEASE NOTES"}
+        )
+        self.release = self.make_release("1.2.0", 11)
+        prepared = self.client.download(self.release)
+        with self.assertRaisesRegex(UpdateError, "unowned local file"):
+            self.client.install(prepared)
+        self.assertEqual((self.root / "notes.txt").read_bytes(), b"USER NOTES")
+        self.assertEqual((self.root / "app.exe").read_bytes(), old_program)
+        self.assertEqual(
+            (self.root / ".update/github-installed.json").read_bytes(), old_inventory
+        )
+        self.assertEqual(self.client.current_version, "1.1.0")
+
     def test_modified_obsolete_file_is_not_deleted(self):
         self.client.install(self.client.download(self.release))
         (self.root / "app.exe").write_bytes(b"local replacement")
@@ -290,6 +339,37 @@ class TestGitHubUpdater(unittest.TestCase):
         self.assertFalse((self.root / "config/app.example.yml").exists())
         self.assertFalse((self.root / ".update/github-installed.json").exists())
         self.assertFalse(self.client.recover())
+
+    def test_rollback_skips_unchanged_locked_original(self):
+        self.content = archive({"a.exe": b"new a", "b.dll": b"old b"})
+        self.release = self.make_release()
+        (self.root / "a.exe").write_bytes(b"old a")
+        (self.root / "b.dll").write_bytes(b"old b")
+        prepared = self.client.download(self.release)
+        real_replace = directory._replace
+        locked_attempts = []
+
+        def occupied(source, target, temporary):
+            if target == self.root / "b.dll":
+                locked_attempts.append(source)
+                raise PermissionError("DLL locked")
+            return real_replace(source, target, temporary)
+
+        with patch.object(directory, "_replace", side_effect=occupied):
+            with (
+                self.assertLogs(directory.__name__, level="ERROR"),
+                self.assertRaises(PermissionError),
+            ):
+                self.client.install(prepared)
+            self.assertFalse(self.client.recover())
+        self.assertEqual(len(locked_attempts), 1)
+        self.assertEqual((self.root / "a.exe").read_bytes(), b"old a")
+        self.assertEqual((self.root / "b.dll").read_bytes(), b"old b")
+        journal = json.loads(
+            (self.root / ".update/github-transaction.json").read_text()
+        )
+        self.assertEqual(journal["phase"], "rolled_back")
+        self.assertFalse((self.root / ".update/github-installed.json").exists())
 
     def test_prepared_tampering_is_rejected_before_writes(self):
         prepared = self.client.download(self.release)

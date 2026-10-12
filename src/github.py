@@ -146,7 +146,6 @@ class GitHubUpdater:
         if (
             not isinstance(release.tag, str)
             or version_number(release.tag) != version_number(release.version)
-            or version_number(release.version) <= version_number(self.current_version)
             or release.archive_url != self._url(release.tag)
             or type(release.asset_id) is not int
             or release.asset_id <= 0
@@ -179,6 +178,8 @@ class GitHubUpdater:
     ) -> PreparedUpdate:
         """Resume a download; interruption/cancellation preserves downloaded bytes."""
         self._validate_release(release)
+        if version_number(release.version) <= version_number(self.current_version):
+            raise UpdateError("Update version must be newer")
         check_cancelled(cancelled)
         directory = update_directory(self.install_dir)
         with FileLease(directory / "github.lock"):

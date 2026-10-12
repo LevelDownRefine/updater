@@ -96,6 +96,8 @@ def recover_directory(root: Path) -> bool:
         target = target_path(root, name)
         if digest is None:
             target.unlink(missing_ok=True)
+        elif target.is_file() and file_digest(target) == digest:
+            continue
         else:
             _replace(target_path(work / "previous", name), target, work / "swap.tmp")
     if data["inventory"] is None:
@@ -143,6 +145,13 @@ def install_directory(root, package, data, repository, asset_name, current_versi
         target = target_path(root, name)
         if target.exists() and not target.is_file():
             raise UpdateError(f"Update conflicts with a local directory: {name}")
+        if (
+            old is not None
+            and name in files
+            and name not in old_files
+            and target.is_file()
+        ):
+            raise UpdateError(f"Update conflicts with an unowned local file: {name}")
         if (
             name in old_files
             and name not in files
