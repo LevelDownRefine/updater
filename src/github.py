@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import zipfile
+import zlib
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -219,7 +220,11 @@ class GitHubUpdater:
                 except (UpdateCancelled, RangeInterrupted):
                     # Cancellation preserves already received range blocks and staged files.
                     raise
-                except (ValueError, zipfile.BadZipFile):
+                except (zipfile.BadZipFile, zlib.error) as exc:
+                    if (work / "ranges").exists():
+                        remove_directory(work / "ranges")
+                    raise UpdateError("Invalid remote ZIP; retry download") from exc
+                except ValueError:
                     if (work / "ranges").exists():
                         remove_directory(work / "ranges")
                     raise
@@ -443,7 +448,7 @@ class GitHubUpdater:
                     files[name] = file_digest(target)
                     if expected is not None and files[name] != expected[name]:
                         raise UpdateError(f"Partial-update checksum mismatch: {name}")
-        except zipfile.BadZipFile as exc:
+        except (zipfile.BadZipFile, zlib.error) as exc:
             if isinstance(archive, Path):
                 archive.unlink(missing_ok=True)
             raise UpdateError("Invalid ZIP asset; retry download") from exc

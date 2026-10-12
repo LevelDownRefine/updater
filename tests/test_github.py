@@ -29,7 +29,7 @@ from updater.remote_zip import RangeInterrupted
 from updater.utils import file_digest
 
 
-def archive(files):
+def archive(files, compression=zipfile.ZIP_STORED):
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w") as bundle:
         bundle.writestr("App/", b"")
@@ -37,6 +37,7 @@ def archive(files):
             entry = zipfile.ZipInfo("placeholder")
             entry.filename = "App/" + name
             entry.orig_filename = entry.filename
+            entry.compress_type = compression
             bundle.writestr(entry, content)
     return output.getvalue()
 
@@ -249,6 +250,31 @@ class TestGitHubUpdater(unittest.TestCase):
         for path in cached:
             path.write_bytes(b"x" * path.stat().st_size)
         with self.assertRaises((UpdateError, zipfile.BadZipFile)):
+            self.client.download(self.release)
+        self.assertFalse((prepared.directory / "ranges").exists())
+        self.client.download(self.release)
+
+    def test_partial_reloads_corrupt_deflate_block(self):
+        self.partial_fixture()
+        with zipfile.ZipFile(io.BytesIO(self.content)) as source:
+            files = {
+                item.filename.removeprefix("App/"): source.read(item)
+                for item in source.infolist()
+                if not item.is_dir()
+            }
+        self.content = archive(files, compression=zipfile.ZIP_DEFLATED)
+        self.release = self.make_release()
+        prepared = self.client.download(self.release)
+        with zipfile.ZipFile(io.BytesIO(self.content)) as source:
+            item = source.getinfo("App/changed.bin")
+        offset = item.header_offset + 30 + len(item.filename.encode()) + len(item.extra)
+        block_start = offset // 65536 * 65536
+        block = prepared.directory / "ranges" / f"{block_start}.bin"
+        data = bytearray(block.read_bytes())
+        data[offset - block_start] = 7  # Invalid DEFLATE block type.
+        block.write_bytes(data)
+        (prepared.directory / "package/changed.bin").unlink()
+        with self.assertRaises(UpdateError):
             self.client.download(self.release)
         self.assertFalse((prepared.directory / "ranges").exists())
         self.client.download(self.release)
