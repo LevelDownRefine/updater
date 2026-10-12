@@ -1,60 +1,83 @@
 # updater
 
-从 OneDragon-Helper 拆出的独立更新库，Python 3.11+，不依赖 Qt、助手的配置工具或任务执行器。
-
-下载、SHA-256 校验、运行锁、安装事务、失败回滚与中断恢复由本库负责。应用通过
-`UpdatePolicy` 提供 GitHub 仓库、发布附件名、ZIP 顶层目录、必要文件、程序文件白名单、
-进程路径及重启参数；没有默认应用，也没有全局可变配置。
+基于 GitHub Releases 的多文件程序更新库，Python 3.11+。支持普通 ZIP、断点续传、
+取消、SHA-256 校验、文件替换、失败回滚和中断恢复；不要求 Qt、PyInstaller 或特定前端。
 
 ```python
 from pathlib import Path
-from updater.service import UpdateService
+from updater import GitHubUpdater
 
-# policy 由应用声明，参见 tests/support/policy.py 的完整合成示例。
-client = UpdateService(Path("installed"), policy=policy)
-release = client.check_update()  # 显式联网；仅正式冻结构建支持原位更新
+updater = GitHubUpdater(
+    repository="owner/repo",
+    asset_name="App.zip",
+    install_dir=Path("installed"),
+    current_version="1.2.3",
+    archive_prefix="App/",  # ZIP 无顶层目录时省略
+)
+release = updater.check()
 if release is not None:
-    prepared = client.prepare_update(release)
-    client.start_update(prepared)  # ready 后调用方必须退出，安装器才替换文件
+    prepared = updater.download(release)
+    # 应用退出后，在独立更新进程中执行；该进程须位于安装目录之外。
+    updater.install(prepared)
 ```
 
-独立安装器入口随应用打包：
+## 发布格式
 
-```python
-from updater.worker import main
-from application.update_policy import POLICY
+在 GitHub Release 上传普通 ZIP 即可。稳定版本 tag 可以是 `1.2.3` 或 `v1.2.3`。
+库不要求发布 `version.json`、`update-manifest.json` 或专用校验附件。
 
-if __name__ == "__main__":
-    raise SystemExit(main(POLICY))
-```
+`check()` 仅查询最新稳定 Release 并按附件名选择 ZIP，没有更新或没有 Release 时
+返回 `None`；缺少指定附件等错误显式报错。它不读安装目录，不写缓存，也不检查
+`sys.frozen`。版本和安装目录由调用方明确提供。
 
-该入口接收 `--root`、`--package` 或 `--recover`，以及 PID／创建时间、就绪回执、取消、
-结果路径与 `--restart`；安装器从安装目录之外的副本运行，等待调用进程退出，不终止已有任务。
-应用启动入口通过 `application_lease(root, policy=policy)` 持有共享锁。
+GitHub 附件提供 SHA-256 digest 时，下载完成后必须匹配该值；附件没有 digest 时
+仍验证声明的下载大小以及 ZIP 的 CRC。后者不等于来源认证，发行来源依赖 HTTPS
+和 GitHub 仓库权限。
 
-| 模块 | 职责 |
-| --- | --- |
-| policy | 应用提供的发布与布局规则 |
-| package | schema 1 清单、路径边界、哈希及本地／远端 ZIP 流式解包 |
-| remote | remotezip 范围读取、取消与区间缓存 |
-| runtime | 更新闸门、共享运行锁、按完整路径识别应用进程 |
-| installer | 文件替换、持久化事务、回滚与恢复 |
-| service | 稳定 Release 检查、下载准备与安装交接 |
-| worker | 无 GUI 的安装器命令行入口 |
+## 下载与断点
 
-协议文件固定为 `update-manifest.json` 与 `version.json`；清单必须列出所有程序文件，
-不得包含用户数据。保留 `frontend` 字段用于发布布局识别，其值由 policy 定义；省略时采用
-`default_frontend`。库始终拒绝路径穿越、Windows 路径别名、链接和 `.update` 工作目录，
-应用白名单无法绕过这些边界。哈希提供完整性校验，发行来源仍依赖 HTTPS 和仓库权限。
+`download()` 始终是同一个接口。进度回调接收 `(received_bytes, total_bytes)`；
+`cancelled` 接收 `threading.Event`，取消时抛 `UpdateCancelled`。网络异常直接传回调用方。
+取消和断网都保留已落盘的字节；再次调用或重新构造相同参数的客户端会继续下载。
 
-开发与验证：
+库按仓库、附件 ID、URL、版本、大小、digest 和 ZIP 前缀区分缓存。续传使用 HTTP
+`Range`，并在可用时发送 ETag／Last-Modified 的 `If-Range`。远端不支持续传或返回
+整包时重新下载；错误的区间或变化的 validator 明确拒绝，不拼接不同版本的字节。
+没有 validator 和 SHA-256 时从头下载，避免无法验证的续传。
+
+`PreparedUpdate` 只在完整下载、校验及解包结束后返回。它可以跨进程传递目录和版本；
+安装会重新验证本地文件及安装目录身份。调用 `updater.discard(release)` 才明确删除
+该附件的下载缓存。工作目录统一位于安装目录的 `.update/`。
+
+## 安装与本地数据
+
+仅替换 ZIP 中的文件，目录结构无需调整：example 和任务声明随 ZIP 更新，实际用户
+配置、日志及其他未发布的本地文件保留原位。不要把实际用户配置放入发布 ZIP。
+
+首次安装只替换同名发布文件，不猜测哪些历史文件属于程序。库在 `.update/` 中记录
+已安装文件清单；后续更新只清理旧清单拥有、新包不再发布的文件。被本地修改的旧文件
+不删除并明确报错。第一版接入前遗留的文件不会被自动清理。
+
+替换前创建并刷盘旧文件快照；失败恢复旧文件和旧清单。进程中断后，在应用重新启动前
+调用 `updater.recover()` 恢复。多更新进程通过安装目录锁互斥。
+
+调用方负责检查任务是否运行、关闭 GUI／CLI／运行器、安排独立更新进程、阻止更新时
+重新启动应用，以及安装后重启。库不推断前端父子关系，不检查 EXE 名称，不杀进程，
+也不改变管理员权限。不要在仍持有程序文件的主进程里调用 `install()`。
+
+## 现有助手接口
+
+`updater.service`、`policy` 和 `worker` 暂时保留给已拆分的 OneDragon-Helper 调用，
+其专用清单、运行锁和进程交接协议不属于新的公开入口。助手迁移单独处理。
+两套安装协议不能同时管理同一个安装目录。
+
+## 开发
 
 ```bash
-uv sync
+uv sync --locked
 uv run python -m unittest discover -s tests -t .
 uv run ruff check .
 uv run ruff format --check .
 ```
 
-测试使用临时目录、合成应用和本地 HTTP 服务；不访问真实安装或用户配置。Windows
-冻结产物及 Qt／Rust 前端交接的集成测试留在调用方 OneDragon-Helper。
+测试使用临时目录、合成应用和本地 HTTP 服务，不访问真实安装或用户配置。
